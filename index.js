@@ -19,6 +19,7 @@ const defaults = {
     injectDepth: 2,
     states: {},
     lastAnalyzed: {},
+    maxActiveRelationships: 3,
     logs: [],
 };
 let busy = false;
@@ -34,7 +35,10 @@ function chatKey() {
 }
 function state() {
     const k = chatKey();
-    s().states[k] ??= { version:1, relationships:[], updatedAt:null, sourceMessageId:-1 };
+    s().states[k] ??= { version:2, relationships:[], updatedAt:null, sourceMessageId:-1 };
+    if (s().states[k].version !== 2) {
+        s().states[k] = { ...s().states[k], version:2, relationships:(s().states[k].relationships||[]).map(r=>({...r,status:r.status||'dormant',lastTouched:r.lastTouched??s().states[k].sourceMessageId??-1})) };
+    }
     return s().states[k];
 }
 function esc(x='') { return String(x).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
@@ -48,7 +52,9 @@ function buildInjection() {
     const st = state();
     if (!Array.isArray(st.relationships) || !st.relationships.length) return '';
     const lines = ['<aftertaste>', '以下是长期互动留下的关系/心理余味。它不是新剧情，也不是角色可直接读取的知识。只在与当前情境相关时自然影响反应；禁止复述、解释或强行触发。'];
-    for (const r of st.relationships) {
+    const active = st.relationships.filter(r=>r.status==='active').slice(0, Number(s().maxActiveRelationships||3));
+    if (!active.length) return '';
+    for (const r of active) {
         lines.push(`\n[${r.pair || '关系'}]`);
         if (r.surface) lines.push(`当前关系: ${r.surface}`);
         if (r.residue) lines.push(`情绪余留: ${r.residue}`);
@@ -113,17 +119,32 @@ function parseJSON(text) {
     if(a<0||b<a) throw new Error('分析 API 没有返回 JSON');
     return JSON.parse(cleaned.slice(a,b+1));
 }
-function sanitizeState(obj, sourceId) {
-    const rels=Array.isArray(obj?.relationships)?obj.relationships.slice(0,12):[];
-    const clean=rels.map(r=>({
+function cleanRel(r, sourceId) {
+    return {
         pair:String(r.pair||'').slice(0,100), surface:String(r.surface||'').slice(0,220),
         residue:String(r.residue||'').slice(0,260), behavior_shift:String(r.behavior_shift||'').slice(0,260),
         unresolved:String(r.unresolved||'').slice(0,260), hidden:String(r.hidden||'').slice(0,260), habit:String(r.habit||'').slice(0,220),
-        confidence: Math.max(0,Math.min(1,Number(r.confidence??0.7))),
-    })).filter(r=>r.pair && r.confidence>=0.55);
-    let out={version:1,relationships:clean,updatedAt:new Date().toISOString(),sourceMessageId:sourceId};
-    while(JSON.stringify(out).length>Number(s().maxStateChars||2400) && out.relationships.length>1) out.relationships.pop();
-    return out;
+        confidence:Math.max(0,Math.min(1,Number(r.confidence??0.7))),
+        status:r.status==='active'?'active':'dormant', lastTouched:Number(r.lastTouched??sourceId),
+    };
+}
+function mergeState(obj, sourceId) {
+    const prev=state();
+    const map=new Map((prev.relationships||[]).map(r=>[String(r.pair||'').trim(),{...r,status:'dormant'}]));
+    for (const raw of (Array.isArray(obj?.relationships)?obj.relationships:[])) {
+        const r=cleanRel(raw,sourceId); if(!r.pair||r.confidence<0.55) continue;
+        const old=map.get(r.pair)||{};
+        map.set(r.pair,{...old,...r,status:'active',lastTouched:sourceId});
+    }
+    for (const pair of (Array.isArray(obj?.resolved)?obj.resolved:[])) map.delete(String(pair).trim());
+    let rels=[...map.values()].sort((x,y)=>(y.status==='active')-(x.status==='active')||(y.lastTouched??-1)-(x.lastTouched??-1));
+    // Storage may be larger than injection; cap only pathological growth.
+    rels=rels.slice(0,40);
+    return {version:2,relationships:rels,updatedAt:new Date().toISOString(),sourceMessageId:sourceId};
+}
+function sanitizeState(obj, sourceId) {
+    const rels=(Array.isArray(obj?.relationships)?obj.relationships:[]).map(r=>cleanRel(r,sourceId)).filter(r=>r.pair&&r.confidence>=0.55).slice(0,40);
+    return {version:2,relationships:rels,updatedAt:new Date().toISOString(),sourceMessageId:sourceId};
 }
 async function analyze(force=false) {
     if(busy||!s().enabled) return;
@@ -137,16 +158,17 @@ async function analyze(force=false) {
         const recent=getRecentMessages();
         addLog(`已读取 ${recent.length} 条消息，约 ${approxTokens(JSON.stringify(recent))} tokens（粗估）`);
         setStatus('请求 API…');
-        const system=`你是长期角色扮演的“关系余味状态压缩器”。你的任务不是总结剧情，而是维护一个极小、可更新的关系心理状态。\n\n硬规则：\n1. 没有充分证据就不要新增永久状态；普通寒暄、递东西、一般关心默认不构成长期变化。\n2. 只保留会影响未来行为的残留：关系阶段、未解决矛盾、行为偏移、形成习惯、未明说/未完全自知的情绪。\n3. 不得把推测写成事实；不创造童年创伤、依恋类型、秘密、诊断或过去事件。\n4. 旧状态应更新/合并/删除，不要无限追加。关系已经变化时覆盖旧结论。\n5. 深度不等于戏剧化。允许“无变化”。\n6. 输出必须是严格 JSON，不要 markdown。最多12组关系，每字段尽量一句。confidence<0.55的内容不要保留。\n\nJSON格式：{"changed":true/false,"relationships":[{"pair":"A→B 或 A↔B","surface":"","residue":"","behavior_shift":"","unresolved":"","hidden":"","habit":"","confidence":0.0}]}`;
-        const user=`当前已有状态：\n${JSON.stringify(current.relationships)}\n\n最近消息：\n${JSON.stringify(recent.map(m => ({...m, text: m.text.slice(0, 1800)})))}\n\n请基于最近消息更新已有状态。若没有足以留下长期余味的新证据，尽量保持原状态并令 changed=false。`;
+        const system=`你是长期角色扮演的“关系余味状态压缩器”。你的任务不是总结剧情，而是维护一个极小、可更新的关系心理状态。\n\n硬规则：\n1. 没有充分证据就不要新增永久状态；普通寒暄、递东西、一般关心默认不构成长期变化。\n2. 只保留会影响未来行为的残留：关系阶段、未解决矛盾、行为偏移、形成习惯、未明说/未完全自知的情绪。\n3. 不得把推测写成事实；不创造童年创伤、依恋类型、秘密、诊断或过去事件。\n4. 你只返回“最近消息中实际被触碰/改变的关系”，不要重写全部旧关系。未出现的角色不要返回，也绝不能视为遗忘。
+5. 只有当某段旧余味在最近消息中被明确解决、失效或推翻时，才把对应 pair 放进 resolved 数组。角色离场、最近没出现，不算 resolved。\n5. 深度不等于戏剧化。允许“无变化”。\n6. 输出必须是严格 JSON，不要 markdown。最多12组关系，每字段尽量一句。confidence<0.55的内容不要保留。\n\nJSON格式：{"changed":true/false,"relationships":[{"pair":"A→B 或 A↔B","surface":"","residue":"","behavior_shift":"","unresolved":"","hidden":"","habit":"","confidence":0.0}]}`;
+        const user=`当前已有状态：\n${JSON.stringify(current.relationships)}\n\n最近消息：\n${JSON.stringify(recent.map(m => ({...m, text: m.text.slice(0, 1800)})))}\n\n请基于最近消息输出“增量更新”。旧状态只是参考：没有在最近消息中出现的旧关系不要复制到 relationships，也不要删除；只有真正解决才写入 resolved。若没有足以留下长期余味的新证据，令 changed=false。`;
         addLog('已发送分析请求，等待 API 返回…');
         const raw=await callAPI([{role:'system',content:system},{role:'user',content:user}],600);
         addLog(`API 已返回：${raw.length} 字符；正在解析 JSON…`);
         setStatus('解析结果…');
         const obj=parseJSON(raw);
-        if(obj.changed!==false) s().states[key]=sanitizeState(obj,newest);
+        if(obj.changed!==false) s().states[key]=mergeState(obj,newest);
         s().lastAnalyzed[key]=newest;
-        addLog(`JSON 解析成功；分析完成：${obj.changed===false?'无长期变化':'状态已更新'}；来源楼层 ${newest}`);
+        addLog(`JSON 解析成功；分析完成：${obj.changed===false?'无长期变化':'增量状态已合并'}；来源楼层 ${newest}`);
         saveSettingsDebounced(); refreshInjection(); renderState(); setStatus('就绪');
     } catch(e) { console.error('[Aftertaste]',e); addLog(`分析失败：${e?.name||'Error'}：${e?.message||String(e)}`); setStatus('错误'); toastr?.error?.(`Aftertaste: ${e.message}`); }
     finally { busy=false; }
@@ -167,12 +189,12 @@ function bind() {
     });
     $('#aftertaste-test').on('click',testAPI); $('#aftertaste-analyze').on('click',()=>analyze(true));
     $('#aftertaste-save-state').on('click',()=>{try{s().states[chatKey()]=sanitizeState(JSON.parse($('#aftertaste-state').val()),state().sourceMessageId);saveSettingsDebounced();renderState();toastr?.success?.('余味状态已保存');}catch(e){toastr?.error?.(`JSON错误：${e.message}`);}});
-    $('#aftertaste-clear').on('click',()=>{if(confirm('清空当前聊天的余味状态？')){s().states[chatKey()]={version:1,relationships:[],updatedAt:null,sourceMessageId:-1};s().lastAnalyzed[chatKey()]=-1;saveSettingsDebounced();renderState();}});
+    $('#aftertaste-clear').on('click',()=>{if(confirm('清空当前聊天的余味状态？')){s().states[chatKey()]={version:2,relationships:[],updatedAt:null,sourceMessageId:-1};s().lastAnalyzed[chatKey()]=-1;saveSettingsDebounced();renderState();}});
     $('#aftertaste-log').text(cfg.logs.join('\n'));
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1.4：外部 API 请求经 SillyTavern CORS Proxy 转发；分析输入额外压缩，并使用 120 秒超时。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.2.0：外部 API 请求经 SillyTavern CORS Proxy 转发；持久余味状态：旧角色离场后休眠而不遗忘；只注入本批次活跃关系，真正解决才删除。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -189,7 +211,7 @@ export function init(){
     eventSource.on(event_types.MESSAGE_EDITED, reconcileAfterEdit);
     eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
     refreshInjection();
-    console.log('[Aftertaste] v0.1.4 initialized');
+    console.log('[Aftertaste] v0.2.0 initialized');
 }
 
 
