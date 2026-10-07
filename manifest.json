@@ -1,6 +1,6 @@
 {
   "display_name": "Aftertaste · 余味 + iPhonie Director",
-  "loading_order": 90,
+  "loading_order": 40,
   "requires": [],
   "optional": [],
   "js": "index.js",
