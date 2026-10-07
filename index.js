@@ -25,6 +25,7 @@ const defaults = {
     // ST-iPhonie companion: keep the main RP prompt tiny, then direct TTS prosody only when a line is actually generated.
     iphonieCompactPrompt: true,
     iphonieDirectorEnabled: true,
+    iphonieDirectorModel: '',
     iphonieDirectorMaxContext: 2200,
 };
 let busy = false;
@@ -86,6 +87,38 @@ function compactIphonieRequest(data) {
         iphonieRuntime.lastPrompt = { at: Date.now(), changed, saved };
         renderIphonieStatus();
     }
+}
+
+function compactIphonieExtensionPrompts() {
+    if (!s().iphonieCompactPrompt) return;
+    const ctx = getContext();
+    const all = ctx?.extensionPrompts || {};
+    let changed = 0, saved = 0;
+    for (const [key, entry] of Object.entries(all)) {
+        if (!key.startsWith('sttts.entry.') || !entry || typeof entry.value !== 'string') continue;
+        const source = entry.value;
+        if (!source.includes('各说话者的朗读规则') && !source.includes('【对白输出硬性规则】') && !source.includes('每一次角色真正说出口的台词')) continue;
+        const result = compactIphonieText(source);
+        if (!result.changed) continue;
+        // extensionPrompts is the live object SillyTavern reads when it builds the prompt.
+        // Mutating only .value preserves ST-iPhonie's position/depth/role/scan metadata.
+        entry.value = result.text;
+        changed++;
+        saved += result.saved;
+    }
+    if (changed) {
+        iphonieRuntime.lastPrompt = { at: Date.now(), changed, saved, early: true };
+        renderIphonieStatus();
+    }
+}
+
+let iphonieEarlyCompactorRegistered = false;
+function registerIphonieEarlyCompactor() {
+    if (iphonieEarlyCompactorRegistered || !event_types.GENERATION_AFTER_COMMANDS) return;
+    iphonieEarlyCompactorRegistered = true;
+    // Registered after ST-iPhonie: its generation listener writes the long rule first;
+    // this listener immediately replaces only that rule before SillyTavern counts/builds the final prompt.
+    eventSource.on(event_types.GENERATION_AFTER_COMMANDS, compactIphonieExtensionPrompts);
 }
 
 function decodeVoiceText(text='') {
@@ -234,7 +267,7 @@ async function directIphonieLine(engine, model, story) {
         '当前语音引擎：' + engine + ' ' + model
     ].filter(Boolean).join('\n\n');
     try {
-        const raw = await callAPI([{role:'system',content:system},{role:'user',content:user}], 220, true);
+        const raw = await callAPI([{role:'system',content:system},{role:'user',content:user}], 220, true, s().iphonieDirectorModel || '');
         const result = parseDirectorJSON(raw, story.target);
         directorCacheSet(key, result);
         iphonieRuntime.lastDirector = { ...result, at: Date.now(), cached: false, speaker: story.speaker, engine, model };
@@ -345,7 +378,7 @@ function renderIphonieStatus() {
     const lines = [
         'ST-iPhonie：' + (detected ? '已检测到' : '暂未检测到'),
         '低 Token：' + (s().iphonieCompactPrompt ? '开' : '关') + (p ? ' · 最近压缩约 ' + Math.ceil((p.saved || 0) / 3) + ' tokens（粗估）' : ''),
-        '情绪导演：' + (s().iphonieDirectorEnabled ? '开' : '关') + (s().apiBase && s().model ? ' · 使用上方 Aftertaste API' : ' · 未配置上方 API')
+        '情绪导演：' + (s().iphonieDirectorEnabled ? '开' : '关') + (s().apiBase && s().model ? ' · 模型 ' + (s().iphonieDirectorModel || s().model) : ' · 未配置上方 API')
     ];
     if (d?.error) lines.push('最近导演：失败 · ' + d.error);
     else if (d) {
@@ -440,7 +473,7 @@ function getRecentMessages() {
 function normalizeBase(base) {
     return String(base||'').trim().replace(/\/+$/, '');
 }
-async function callAPI(messages, maxTokens=700, quiet=false) {
+async function callAPI(messages, maxTokens=700, quiet=false, modelOverride='') {
     const cfg=s();
     if (!cfg.apiBase || !cfg.model) throw new Error('请先填写 API Base URL 和模型 ID');
     const targetUrl = normalizeBase(cfg.apiBase).endsWith('/v1') ? `${normalizeBase(cfg.apiBase)}/chat/completions` : `${normalizeBase(cfg.apiBase)}/v1/chat/completions`;
@@ -455,7 +488,7 @@ async function callAPI(messages, maxTokens=700, quiet=false) {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {
-        res = await fetch(url,{method:'POST',headers,body:JSON.stringify({model:cfg.model,messages,temperature:Number(cfg.temperature||0.2),max_tokens:maxTokens,stream:false}),signal:controller.signal});
+        res = await fetch(url,{method:'POST',headers,body:JSON.stringify({model:String(modelOverride||cfg.model).trim(),messages,temperature:Number(cfg.temperature||0.2),max_tokens:maxTokens,stream:false}),signal:controller.signal});
     } catch (e) {
         if (e?.name === 'AbortError') throw new Error(`API 请求超过 ${timeoutMs/1000} 秒，已自动终止`);
         throw e;
@@ -539,10 +572,11 @@ function bind() {
     $('#aftertaste-temp').val(cfg.temperature);
     $('#aftertaste-iphonie-compact').prop('checked',cfg.iphonieCompactPrompt !== false);
     $('#aftertaste-iphonie-director').prop('checked',cfg.iphonieDirectorEnabled !== false);
+    $('#aftertaste-iphonie-model').val(cfg.iphonieDirectorModel || '');
     $('#aftertaste-settings input').on('change input', function(){
         cfg.enabled=$('#aftertaste-enabled').prop('checked'); cfg.apiBase=$('#aftertaste-api-base').val().trim(); cfg.apiKey=$('#aftertaste-api-key').val().trim(); cfg.model=$('#aftertaste-model').val().trim();
         cfg.interval=Math.max(1,Number($('#aftertaste-interval').val()||5)); cfg.recentMessages=Math.max(2,Number($('#aftertaste-recent').val()||8)); cfg.maxInjectTokens=Math.max(100,Number($('#aftertaste-budget').val()||400)); cfg.injectDepth=Math.max(0,Number($('#aftertaste-depth').val()||2)); cfg.temperature=Number($('#aftertaste-temp').val()||0.2);
-        cfg.iphonieCompactPrompt=$('#aftertaste-iphonie-compact').prop('checked'); cfg.iphonieDirectorEnabled=$('#aftertaste-iphonie-director').prop('checked');
+        cfg.iphonieCompactPrompt=$('#aftertaste-iphonie-compact').prop('checked'); cfg.iphonieDirectorEnabled=$('#aftertaste-iphonie-director').prop('checked'); cfg.iphonieDirectorModel=$('#aftertaste-iphonie-model').val().trim();
         saveSettingsDebounced(); refreshInjection(); renderIphonieStatus();
     });
     $('#aftertaste-test').on('click',testAPI); $('#aftertaste-analyze').on('click',()=>analyze(true));
@@ -552,7 +586,7 @@ function bind() {
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>🎙 ST-iPhonie · 低 Token 情绪导演</h4><label><input id="aftertaste-iphonie-compact" type="checkbox"> 低 Token 配音提示词</label><label><input id="aftertaste-iphonie-director" type="checkbox"> 点击朗读时 AI 情绪导演</label><p class="notes">低 Token 模式只让正文模型标记“谁说了哪句话”，不再常驻注入 Fish / MiniMax / MiMo / ElevenLabs 的整套情绪标签说明。第一次真正生成某句正文语音时，情绪导演才用上方同一个 Aftertaste API 单独看当前台词与附近上下文，生成少量停顿、呼吸、叹气、轻笑等表演指令；重播走语音缓存，不重复分析。</p><pre id="aftertaste-iphonie-status">等待检测…</pre><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>最近一次生成注入记录</h4><pre id="aftertaste-generation-audit">（尚无生成记录）</pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.3.0：保留余味 v0.2.1 的持久关系状态；新增 ST-iPhonie 低 Token 兼容层与按需 AI 情绪导演。正文不再需要常驻携带各家 TTS 的大段标签说明，只有实际生成新语音时才做一次小型表演分析。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>🎙 ST-iPhonie · 低 Token 情绪导演</h4><label><input id="aftertaste-iphonie-compact" type="checkbox"> 低 Token 配音提示词</label><label><input id="aftertaste-iphonie-director" type="checkbox"> 点击朗读时 AI 情绪导演</label><label>情绪导演模型 ID（留空沿用上方模型）<input id="aftertaste-iphonie-model" class="text_pole" placeholder="可填更便宜的 Flash 模型"></label><p class="notes">低 Token 模式只让正文模型标记“谁说了哪句话”，不再常驻注入 Fish / MiniMax / MiMo / ElevenLabs 的整套情绪标签说明。第一次真正生成某句正文语音时，情绪导演才用上方同一个 Aftertaste API 单独看当前台词与附近上下文，生成少量停顿、呼吸、叹气、轻笑等表演指令；重播走语音缓存，不重复分析。</p><pre id="aftertaste-iphonie-status">等待检测…</pre><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>最近一次生成注入记录</h4><pre id="aftertaste-generation-audit">（尚无生成记录）</pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.3.0：保留余味 v0.2.1 的持久关系状态；新增 ST-iPhonie 低 Token 兼容层与按需 AI 情绪导演。正文不再需要常驻携带各家 TTS 的大段标签说明，只有实际生成新语音时才做一次小型表演分析。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -589,6 +623,11 @@ async function initOnce() {
         throw error;
     }
 }
+
+// Install the TTS fetch wrapper as early as possible. Aftertaste loads at order 40 and ST-iPhonie at 50.
+installIphonieFetchDirector();
+// Delay only the GENERATION_AFTER_COMMANDS listener registration, so ST-iPhonie's own listener is registered first.
+setTimeout(registerIphonieEarlyCompactor, 1200);
 
 jQuery(initOnce);
 eventSource.once(event_types.APP_READY, initOnce);
