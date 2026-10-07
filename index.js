@@ -82,7 +82,10 @@ function normalizeBase(base) {
 async function callAPI(messages, maxTokens=700) {
     const cfg=s();
     if (!cfg.apiBase || !cfg.model) throw new Error('请先填写 API Base URL 和模型 ID');
-    const url = normalizeBase(cfg.apiBase).endsWith('/v1') ? `${normalizeBase(cfg.apiBase)}/chat/completions` : `${normalizeBase(cfg.apiBase)}/v1/chat/completions`;
+    const targetUrl = normalizeBase(cfg.apiBase).endsWith('/v1') ? `${normalizeBase(cfg.apiBase)}/chat/completions` : `${normalizeBase(cfg.apiBase)}/v1/chat/completions`;
+    // Route external API calls through SillyTavern's built-in CORS proxy.
+    // Requires enableCorsProxy: true in config.yaml and a server restart.
+    const url = `/proxy/${targetUrl}`;
     const headers={'Content-Type':'application/json'};
     if (cfg.apiKey) headers.Authorization=`Bearer ${cfg.apiKey}`;
     const controller = new AbortController();
@@ -168,7 +171,7 @@ function bind() {
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1.2：OpenAI-compatible /v1/chat/completions。公益站若禁止浏览器跨域请求（CORS），测试会失败；这不是 Key 泄露，而是浏览器安全限制。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1.3：OpenAI-compatible /v1/chat/completions。外部 API 请求经 SillyTavern 内置 CORS Proxy 转发；需要 config.yaml 中 enableCorsProxy: true。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -185,7 +188,7 @@ export function init(){
     eventSource.on(event_types.MESSAGE_EDITED, reconcileAfterEdit);
     eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
     refreshInjection();
-    console.log('[Aftertaste] v0.1.2 initialized');
+    console.log('[Aftertaste] v0.1.3 initialized');
 }
 
 
