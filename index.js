@@ -22,8 +22,338 @@ const defaults = {
     maxActiveRelationships: 3,
     logs: [],
     generationAudit: {},
+    // ST-iPhonie companion: keep the main RP prompt tiny, then direct TTS prosody only when a line is actually generated.
+    iphonieCompactPrompt: true,
+    iphonieDirectorEnabled: true,
+    iphonieDirectorMaxContext: 2200,
 };
 let busy = false;
+
+const iphonieRuntime = {
+    cache: new Map(),
+    lastPrompt: null,
+    lastDirector: null,
+    fetchWrapped: false,
+    nativeFetch: null,
+};
+
+const IPHONE_COMPACT_RULE = [
+    '【ST-iPhonie 配音格式 · 低 Token】',
+    '正文与叙事照常写，不改变角色人设、文风或剧情。',
+    '每次角色真正说出口的中文台词写成：“台词”<tts>实际角色名|同一句台词</tts>。',
+    '旁白、动作、环境、心理活动保持普通正文；未说出口的内容不要加标签。',
+    '不要在正文里写情绪标签、TTS 厂商标签、呼吸声标签或停顿码；这些由播放时的情绪导演单独处理。'
+].join('\n');
+
+function compactIphonieText(text) {
+    let out = String(text ?? '');
+    const before = out;
+    // Shipped ST-iPhonie default prompt.
+    out = out.replace(
+        /正常续写正文与叙事，不要改变角色人设或写作风格。\s*每一次角色真正说出口的台词，[\s\S]*?不要解释规则或输出代码块，不为未说出口的内容生成语音标签。/g,
+        ''
+    );
+    // Huge per-engine emotion / sound-tag manuals.
+    out = out.replace(
+        /各说话者的朗读规则（只用于台词，不改变人物设定）：[\s\S]*?(?=\n\n【对白输出硬性规则】)/g,
+        ''
+    );
+    // Long format contract.
+    out = out.replace(
+        /【对白输出硬性规则】[\s\S]*?直接输出检查后的正文，不输出核对过程。/g,
+        IPHONE_COMPACT_RULE
+    );
+    if (out !== before && !out.includes('ST-iPhonie 配音格式 · 低 Token')) {
+        out = out.trim() + '\n\n' + IPHONE_COMPACT_RULE;
+    }
+    return { text: out, changed: out !== before, saved: Math.max(0, before.length - out.length) };
+}
+
+function compactIphonieRequest(data) {
+    if (!s().iphonieCompactPrompt || !Array.isArray(data?.messages)) return;
+    let changed = 0, saved = 0;
+    for (const message of data.messages) {
+        if (!message || typeof message.content !== 'string') continue;
+        const source = message.content;
+        if (!source.includes('各说话者的朗读规则') && !source.includes('【对白输出硬性规则】') && !source.includes('每一次角色真正说出口的台词')) continue;
+        const result = compactIphonieText(source);
+        if (!result.changed) continue;
+        message.content = result.text;
+        changed++;
+        saved += result.saved;
+    }
+    if (changed) {
+        iphonieRuntime.lastPrompt = { at: Date.now(), changed, saved };
+        renderIphonieStatus();
+    }
+}
+
+function decodeVoiceText(text='') {
+    return String(text)
+        .replaceAll('&amp;', '&').replaceAll('&lt;', '<').replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"').replaceAll('&#39;', "'");
+}
+
+const MINI_CUES = new Set(['laughs','chuckle','coughs','clear-throat','groans','breath','pant','inhale','exhale','gasps','sniffs','sighs','snorts','burps','lip-smacking','humming','hissing','emm','sneezes']);
+const GENERIC_CUES = new Set(['breath','sigh','chuckle','laugh','inhale','exhale','gasp','sniff','emm']);
+const DIRECTOR_EMOTIONS = new Set(['neutral','happy','sad','angry','fearful','disgusted','surprised','calm']);
+
+function stripKnownProsody(text='') {
+    return String(text)
+        .replace(/<#\d+(?:\.\d+)?#>/g, '')
+        .replace(/\(([^()]{1,40})\)/g, (m, inner) => MINI_CUES.has(String(inner).trim().toLowerCase()) ? '' : m)
+        .replace(/\[[a-z][^\]\n]{0,70}\]/gi, '')
+        .replace(/^\s*\((?:开心|悲伤|愤怒|恐惧|惊讶|兴奋|委屈|平静|冷漠|怅然|欣慰|无奈|愧疚|释然|嫉妒|厌倦|忐忑|动情|温柔|高冷|活泼|严肃|慵懒|俏皮|深沉|干练|凌厉)\)\s*/u, '')
+        .trim();
+}
+
+function canonicalSpeech(text='') {
+    return stripKnownProsody(text).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+function taggedVoiceLines(raw='') {
+    const list = [];
+    for (const match of String(raw).matchAll(/<tts>([^<]{1,6000}?)<\/tts>/gi)) {
+        const parts = match[1].split('|');
+        if (parts.length < 2 || parts.length > 3) continue;
+        const role = decodeVoiceText(parts[0]).trim();
+        const emotion = parts.length === 3 ? decodeVoiceText(parts[1]).trim() : '';
+        const text = decodeVoiceText(parts.at(-1)).trim();
+        if (!role || !text) continue;
+        list.push({ index: list.length, at: match.index ?? 0, end: (match.index ?? 0) + match[0].length, role, emotion, text });
+    }
+    return list;
+}
+
+function trimPlainContext(raw, at, end, maxChars) {
+    const half = Math.max(500, Math.floor(maxChars / 2));
+    const from = Math.max(0, Number(at || 0) - half);
+    const to = Math.min(String(raw).length, Number(end || 0) + half);
+    return String(raw).slice(from, to)
+        .replace(/<tts>[^<]*<\/tts>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s{3,}/g, '\n\n')
+        .trim()
+        .slice(0, maxChars);
+}
+
+function findIphonieStoryContext(targetText) {
+    const ctx = getContext();
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    const wanted = canonicalSpeech(targetText);
+    if (!wanted) return null;
+    for (let i = chat.length - 1; i >= Math.max(0, chat.length - 20); i--) {
+        const message = chat[i];
+        if (!message || message.is_user || message.is_system) continue;
+        const raw = String(message.mes || '');
+        const lines = taggedVoiceLines(raw);
+        for (const line of lines) {
+            const got = canonicalSpeech(line.text);
+            if (!got || !(got === wanted || (Math.min(got.length, wanted.length) >= 6 && (got.includes(wanted) || wanted.includes(got))))) continue;
+            let previousUser = '';
+            for (let j = i - 1; j >= Math.max(0, i - 6); j--) {
+                if (chat[j]?.is_user) { previousUser = String(chat[j].mes || ''); break; }
+            }
+            const speaker = line.role;
+            const card = ctx.characters?.find?.(c => c?.name === speaker);
+            const profile = card ? [card.description, card.personality].filter(Boolean).join('\n').slice(0, 800) : '';
+            return {
+                chat: chatKey(), messageId: i, lineIndex: line.index, speaker,
+                target: stripKnownProsody(targetText),
+                current: trimPlainContext(raw, line.at, line.end, Number(s().iphonieDirectorMaxContext || 2200)),
+                previousUser: previousUser.replace(/<[^>]+>/g, ' ').slice(-700),
+                profile,
+            };
+        }
+    }
+    return null;
+}
+
+function directorCacheSet(key, value) {
+    iphonieRuntime.cache.delete(key);
+    iphonieRuntime.cache.set(key, value);
+    while (iphonieRuntime.cache.size > 120) iphonieRuntime.cache.delete(iphonieRuntime.cache.keys().next().value);
+}
+
+function stripGenericTokens(text='') {
+    return String(text).replace(/<(?:pause=\d+(?:\.\d+)?|breath|sigh|chuckle|laugh|inhale|exhale|gasp|sniff|emm)>/gi, '');
+}
+
+function sanitizeDirectorAnnotated(original, annotated) {
+    let count = 0;
+    let text = String(annotated || original).replace(/<(pause=\d+(?:\.\d+)?|breath|sigh|chuckle|laugh|inhale|exhale|gasp|sniff|emm)>/gi, (whole, token) => {
+        if (++count > 5) return '';
+        const lower = String(token).toLowerCase();
+        if (lower.startsWith('pause=')) {
+            const n = Math.max(0.12, Math.min(0.9, Number(lower.slice(6)) || 0.3));
+            return '<pause=' + Math.round(n * 100) / 100 + '>';
+        }
+        return GENERIC_CUES.has(lower) ? '<' + lower + '>' : '';
+    });
+    // Drop any invented angle-bracket instruction. The spoken words themselves must stay the same.
+    text = text.replace(/<(?!pause=|breath>|sigh>|chuckle>|laugh>|inhale>|exhale>|gasp>|sniff>|emm>)[^>\n]{1,80}>/gi, '');
+    const plainOriginal = canonicalSpeech(original);
+    const plainDirected = stripGenericTokens(text).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+    return plainOriginal && plainOriginal === plainDirected ? text : original;
+}
+
+function parseDirectorJSON(raw, original) {
+    const obj = parseJSON(raw);
+    const emotion = DIRECTOR_EMOTIONS.has(String(obj.emotion || '').toLowerCase()) ? String(obj.emotion).toLowerCase() : 'neutral';
+    const delivery = /^[a-z][a-z ,'-]{0,70}$/i.test(String(obj.delivery_en || '').trim()) ? String(obj.delivery_en).trim().toLowerCase() : '';
+    const style = String(obj.style_zh || '').replace(/[()（）[\]<>]/g, '').trim().slice(0, 12);
+    const annotated = sanitizeDirectorAnnotated(original, obj.annotated);
+    return { emotion, delivery, style, annotated };
+}
+
+async function directIphonieLine(engine, model, story) {
+    if (!s().iphonieDirectorEnabled || !story || !s().apiBase || !s().model) return null;
+    const key = [story.chat, story.messageId, story.lineIndex, engine, model, canonicalSpeech(story.target)].join('|');
+    if (iphonieRuntime.cache.has(key)) {
+        const hit = iphonieRuntime.cache.get(key);
+        iphonieRuntime.lastDirector = { ...hit, at: Date.now(), cached: true, speaker: story.speaker, engine, model };
+        renderIphonieStatus();
+        return hit;
+    }
+    const system = [
+        '你是中文角色扮演的 TTS 表演导演。只决定“这句话怎么念”，不改剧情、不改台词。',
+        '根据角色、上一轮用户、当前回复里的动作/旁白和目标台词判断真实口语表演。',
+        '真人感优先：不要把每句话都演得很重；没有明确情绪时 emotion=neutral。亲密、嘴硬、疲惫、犹豫等细节优先用少量自然停顿或呼吸体现，而不是夸张标签。',
+        'annotated 必须保留目标台词的全部文字和顺序，只允许插入以下标记：<pause=0.30>、<breath>、<sigh>、<chuckle>、<laugh>、<inhale>、<exhale>、<gasp>、<sniff>、<emm>。',
+        '一条台词最多 5 个标记，通常 0–2 个就够。不要机械地每句叹气、喘息、耳语或加停顿。pause 建议 0.15–0.65 秒，只有明显停顿才更长。',
+        'emotion 只能是 neutral, happy, sad, angry, fearful, disgusted, surprised, calm 之一。',
+        'delivery_en 用 1–6 个英文词描述声音表演，例如 soft, slightly tired；style_zh 用 1–2 个中文词概括语气。',
+        '只输出严格 JSON：{"emotion":"neutral","delivery_en":"","style_zh":"","annotated":"原台词"}，不要 Markdown。'
+    ].join('\n');
+    const user = [
+        '说话者：' + story.speaker,
+        story.profile ? '角色设定摘要：' + story.profile : '',
+        story.previousUser ? '上一轮用户：' + story.previousUser : '',
+        '当前回复片段：' + story.current,
+        '目标台词：' + story.target,
+        '当前语音引擎：' + engine + ' ' + model
+    ].filter(Boolean).join('\n\n');
+    try {
+        const raw = await callAPI([{role:'system',content:system},{role:'user',content:user}], 220, true);
+        const result = parseDirectorJSON(raw, story.target);
+        directorCacheSet(key, result);
+        iphonieRuntime.lastDirector = { ...result, at: Date.now(), cached: false, speaker: story.speaker, engine, model };
+        renderIphonieStatus();
+        return result;
+    } catch (error) {
+        iphonieRuntime.lastDirector = { at: Date.now(), error: error?.message || String(error), speaker: story.speaker, engine, model };
+        renderIphonieStatus();
+        return null;
+    }
+}
+
+function genericTokenMap(text, engine, model) {
+    const miniMap = {breath:'breath',sigh:'sighs',chuckle:'chuckle',laugh:'laughs',inhale:'inhale',exhale:'exhale',gasp:'gasps',sniff:'sniffs',emm:'emm'};
+    const fishS1Map = {breath:'',sigh:'(sighing)',chuckle:'(chuckling)',laugh:'(laughing)',inhale:'',exhale:'',gasp:'(gasping)',sniff:'',emm:''};
+    const mimoMap = {breath:'[深呼吸]',sigh:'[叹气]',chuckle:'[轻笑]',laugh:'[笑]',inhale:'[吸气]',exhale:'[呼气]',gasp:'[震惊]',sniff:'[鼻音]',emm:'[心虚]'};
+    return String(text).replace(/<(pause=\d+(?:\.\d+)?|breath|sigh|chuckle|laugh|inhale|exhale|gasp|sniff|emm)>/gi, (whole, token) => {
+        const lower = String(token).toLowerCase();
+        if (lower.startsWith('pause=')) {
+            const sec = Math.max(0.12, Math.min(0.9, Number(lower.slice(6)) || 0.3));
+            if (engine === 'mini') return '<#' + (Math.round(sec * 100) / 100) + '#>';
+            if (engine === 'fish' && String(model).includes('s1')) return sec >= 0.5 ? '(long-break)' : '(break)';
+            return sec >= 0.45 ? '……' : '…';
+        }
+        if (engine === 'mini') return String(model).startsWith('speech-2.8') && miniMap[lower] ? '(' + miniMap[lower] + ')' : '';
+        if (engine === 'mimo') return mimoMap[lower] || '';
+        if (engine === 'fish' && String(model).includes('s1')) return fishS1Map[lower] || '';
+        const square = {breath:'breath',sigh:'sigh',chuckle:'chuckles',laugh:'laughs',inhale:'inhales',exhale:'exhales',gasp:'gasps',sniff:'sniffs',emm:'hesitates'}[lower];
+        return square ? '[' + square + '] ' : '';
+    });
+}
+
+function directedTextFor(engine, model, result) {
+    let text = genericTokenMap(result.annotated, engine, model);
+    if (engine === 'fish' && !String(model).includes('s1') && result.delivery) text = '[' + result.delivery + '] ' + text;
+    if (engine === 'eleven' && /^eleven_v[34]/.test(String(model)) && result.delivery) text = '[' + result.delivery + '] ' + text;
+    if (engine === 'mimo' && result.style) text = '(' + result.style + ')' + text;
+    if (engine === 'fish' && String(model).includes('s1') && result.emotion !== 'neutral') {
+        const allowed = new Set(['happy','sad','angry','excited','calm','nervous','confident','surprised','satisfied','delighted','scared','worried','upset','frustrated','depressed','empathetic','embarrassed','disgusted','moved','proud','relaxed','grateful','curious','sarcastic','disdainful','unhappy','anxious','hysterical','indifferent','uncertain','doubtful','confused','disappointed','regretful','guilty','ashamed','jealous','envious','hopeful','optimistic','pessimistic','nostalgic','lonely','bored','contemptuous','sympathetic','compassionate','determined','resigned']);
+        const e = result.emotion === 'fearful' ? 'scared' : result.emotion;
+        if (allowed.has(e)) text = '(' + e + ') ' + text;
+    }
+    return text;
+}
+
+function iphonieTtsInfo(url, body) {
+    const u = String(url || '');
+    if (body?.model && /^speech-/.test(body.model) && /\/v1\/t2a_v2(?:\?|$)/i.test(u) && typeof body.text === 'string') return {engine:'mini', model:body.model, text:body.text};
+    if (body?.model && /^mimo-v2\.5-tts/.test(body.model) && /chat\/completions/i.test(u) && Array.isArray(body.messages)) {
+        const msg = [...body.messages].reverse().find(m => m?.role === 'assistant' && typeof m.content === 'string');
+        if (msg) return {engine:'mimo', model:body.model, text:msg.content, message:msg};
+    }
+    if (typeof body?.model_id === 'string' && /^eleven_/.test(body.model_id) && /\/v1\/text-to-speech\//i.test(u) && typeof body.text === 'string') return {engine:'eleven', model:body.model_id, text:body.text};
+    if (typeof body?.input === 'string' && /audio\/speech/i.test(u)) {
+        const model = String(body.model || body.provider?.options?.['fish-audio']?.model || '');
+        if (/fish|s2|s1|drama/i.test(model) || body.provider?.options?.['fish-audio']) return {engine:'fish', model:model.replace(/^fish-audio\//,''), text:body.input};
+    }
+    return null;
+}
+
+async function maybeDirectIphonieFetch(input, init) {
+    if (!s().iphonieDirectorEnabled || typeof init?.body !== 'string') return init;
+    let body;
+    try { body = JSON.parse(init.body); } catch { return init; }
+    const info = iphonieTtsInfo(typeof input === 'string' ? input : input?.url, body);
+    if (!info) return init;
+    const cleanTarget = stripKnownProsody(info.text);
+    const story = findIphonieStoryContext(cleanTarget);
+    if (!story) return init; // engine auditions / phone calls / unrelated TTS are untouched.
+    const directed = await directIphonieLine(info.engine, info.model, { ...story, target: cleanTarget });
+    if (!directed) return init;
+    const next = structuredClone(body);
+    const spoken = directedTextFor(info.engine, info.model, directed);
+    if (info.engine === 'mini') {
+        next.text = spoken;
+        next.voice_setting ??= {};
+        if (!next.voice_setting.emotion && directed.emotion !== 'neutral') next.voice_setting.emotion = directed.emotion;
+    } else if (info.engine === 'fish') {
+        next.input = spoken;
+    } else if (info.engine === 'eleven') {
+        next.text = spoken;
+    } else if (info.engine === 'mimo') {
+        const msg = [...next.messages].reverse().find(m => m?.role === 'assistant' && typeof m.content === 'string');
+        if (msg) msg.content = spoken;
+    }
+    return { ...init, body: JSON.stringify(next) };
+}
+
+function installIphonieFetchDirector() {
+    if (iphonieRuntime.fetchWrapped) return;
+    iphonieRuntime.fetchWrapped = true;
+    iphonieRuntime.nativeFetch = globalThis.fetch.bind(globalThis);
+    globalThis.fetch = async function(input, init) {
+        let next = init;
+        try { next = await maybeDirectIphonieFetch(input, init); } catch (error) {
+            iphonieRuntime.lastDirector = { at: Date.now(), error: error?.message || String(error) };
+            renderIphonieStatus();
+        }
+        return iphonieRuntime.nativeFetch(input, next);
+    };
+}
+
+function renderIphonieStatus() {
+    const box = $('#aftertaste-iphonie-status');
+    if (!box.length) return;
+    const detected = !!document.querySelector('#sttts-extension-entry');
+    const p = iphonieRuntime.lastPrompt, d = iphonieRuntime.lastDirector;
+    const lines = [
+        'ST-iPhonie：' + (detected ? '已检测到' : '暂未检测到'),
+        '低 Token：' + (s().iphonieCompactPrompt ? '开' : '关') + (p ? ' · 最近压缩约 ' + Math.ceil((p.saved || 0) / 3) + ' tokens（粗估）' : ''),
+        '情绪导演：' + (s().iphonieDirectorEnabled ? '开' : '关') + (s().apiBase && s().model ? ' · 使用上方 Aftertaste API' : ' · 未配置上方 API')
+    ];
+    if (d?.error) lines.push('最近导演：失败 · ' + d.error);
+    else if (d) {
+        lines.push('最近导演：' + (d.speaker || '') + ' · ' + (d.engine || '') + ' ' + (d.model || '') + ' · emotion=' + d.emotion + (d.cached ? ' · 缓存' : ''));
+        lines.push('实际表演稿：' + String(d.annotated || '').slice(0, 260));
+    }
+    box.text(lines.join('\n'));
+}
 
 function s() {
     extension_settings[MODULE] ??= structuredClone(defaults);
@@ -110,14 +440,14 @@ function getRecentMessages() {
 function normalizeBase(base) {
     return String(base||'').trim().replace(/\/+$/, '');
 }
-async function callAPI(messages, maxTokens=700) {
+async function callAPI(messages, maxTokens=700, quiet=false) {
     const cfg=s();
     if (!cfg.apiBase || !cfg.model) throw new Error('请先填写 API Base URL 和模型 ID');
     const targetUrl = normalizeBase(cfg.apiBase).endsWith('/v1') ? `${normalizeBase(cfg.apiBase)}/chat/completions` : `${normalizeBase(cfg.apiBase)}/v1/chat/completions`;
     // Route external API calls through SillyTavern's built-in CORS proxy.
     // Requires enableCorsProxy: true in config.yaml and a server restart.
     const url = `/proxy/${targetUrl}`;
-    addLog(`请求路径：SillyTavern CORS Proxy → ${targetUrl.replace(/\\?.*$/, '')}`);
+    if (!quiet) addLog(`请求路径：SillyTavern CORS Proxy → ${targetUrl.replace(/\\?.*$/, '')}`);
     const headers={'Content-Type':'application/json'};
     if (cfg.apiKey) headers.Authorization=`Bearer ${cfg.apiKey}`;
     const controller = new AbortController();
@@ -207,19 +537,22 @@ function bind() {
     $('#aftertaste-enabled').prop('checked',cfg.enabled); $('#aftertaste-api-base').val(cfg.apiBase); $('#aftertaste-api-key').val(cfg.apiKey); $('#aftertaste-model').val(cfg.model);
     $('#aftertaste-interval').val(cfg.interval); $('#aftertaste-recent').val(cfg.recentMessages); $('#aftertaste-budget').val(cfg.maxInjectTokens); $('#aftertaste-depth').val(cfg.injectDepth);
     $('#aftertaste-temp').val(cfg.temperature);
+    $('#aftertaste-iphonie-compact').prop('checked',cfg.iphonieCompactPrompt !== false);
+    $('#aftertaste-iphonie-director').prop('checked',cfg.iphonieDirectorEnabled !== false);
     $('#aftertaste-settings input').on('change input', function(){
         cfg.enabled=$('#aftertaste-enabled').prop('checked'); cfg.apiBase=$('#aftertaste-api-base').val().trim(); cfg.apiKey=$('#aftertaste-api-key').val().trim(); cfg.model=$('#aftertaste-model').val().trim();
         cfg.interval=Math.max(1,Number($('#aftertaste-interval').val()||5)); cfg.recentMessages=Math.max(2,Number($('#aftertaste-recent').val()||8)); cfg.maxInjectTokens=Math.max(100,Number($('#aftertaste-budget').val()||400)); cfg.injectDepth=Math.max(0,Number($('#aftertaste-depth').val()||2)); cfg.temperature=Number($('#aftertaste-temp').val()||0.2);
-        saveSettingsDebounced(); refreshInjection();
+        cfg.iphonieCompactPrompt=$('#aftertaste-iphonie-compact').prop('checked'); cfg.iphonieDirectorEnabled=$('#aftertaste-iphonie-director').prop('checked');
+        saveSettingsDebounced(); refreshInjection(); renderIphonieStatus();
     });
     $('#aftertaste-test').on('click',testAPI); $('#aftertaste-analyze').on('click',()=>analyze(true));
     $('#aftertaste-save-state').on('click',()=>{try{s().states[chatKey()]=sanitizeState(JSON.parse($('#aftertaste-state').val()),state().sourceMessageId);saveSettingsDebounced();renderState();toastr?.success?.('余味状态已保存');}catch(e){toastr?.error?.(`JSON错误：${e.message}`);}});
     $('#aftertaste-clear').on('click',()=>{if(confirm('清空当前聊天的余味状态？')){s().states[chatKey()]={version:2,relationships:[],updatedAt:null,sourceMessageId:-1};s().lastAnalyzed[chatKey()]=-1;saveSettingsDebounced();renderState();}});
-    $('#aftertaste-log').text(cfg.logs.join('\n')); renderGenerationAudit();
+    $('#aftertaste-log').text(cfg.logs.join('\n')); renderGenerationAudit(); renderIphonieStatus();
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>最近一次生成注入记录</h4><pre id="aftertaste-generation-audit">（尚无生成记录）</pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.2.1：外部 API 请求经 SillyTavern CORS Proxy 转发；持久余味状态 + 生成注入审计 + 休眠角色即时唤醒。旧关系不因离场遗忘，角色重新出现时无需等待分析周期即可恢复相关余味。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>🎙 ST-iPhonie · 低 Token 情绪导演</h4><label><input id="aftertaste-iphonie-compact" type="checkbox"> 低 Token 配音提示词</label><label><input id="aftertaste-iphonie-director" type="checkbox"> 点击朗读时 AI 情绪导演</label><p class="notes">低 Token 模式只让正文模型标记“谁说了哪句话”，不再常驻注入 Fish / MiniMax / MiMo / ElevenLabs 的整套情绪标签说明。第一次真正生成某句正文语音时，情绪导演才用上方同一个 Aftertaste API 单独看当前台词与附近上下文，生成少量停顿、呼吸、叹气、轻笑等表演指令；重播走语音缓存，不重复分析。</p><pre id="aftertaste-iphonie-status">等待检测…</pre><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>最近一次生成注入记录</h4><pre id="aftertaste-generation-audit">（尚无生成记录）</pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.3.0：保留余味 v0.2.1 的持久关系状态；新增 ST-iPhonie 低 Token 兼容层与按需 AI 情绪导演。正文不再需要常驻携带各家 TTS 的大段标签说明，只有实际生成新语音时才做一次小型表演分析。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -228,15 +561,16 @@ function reconcileAfterEdit(){
     refreshInjection(); renderState();
 }
 export function init(){
-    s(); addUI();
+    s(); addUI(); installIphonieFetchDirector();
+    if (event_types.CHAT_COMPLETION_SETTINGS_READY) eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, compactIphonieRequest);
     eventSource.on(event_types.GENERATION_STARTED, ()=>{ wakeDormantFromRecentText(); refreshInjection(); recordGenerationInjection(); });
     eventSource.on(event_types.MESSAGE_RECEIVED, ()=>analyze(false));
     eventSource.on(event_types.CHAT_CHANGED, ()=>setTimeout(()=>{renderState();refreshInjection();},100));
-    eventSource.on(event_types.MESSAGE_DELETED, reconcileAfterEdit);
-    eventSource.on(event_types.MESSAGE_EDITED, reconcileAfterEdit);
-    eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
+    eventSource.on(event_types.MESSAGE_DELETED, ()=>{ iphonieRuntime.cache.clear(); reconcileAfterEdit(); });
+    eventSource.on(event_types.MESSAGE_EDITED, ()=>{ iphonieRuntime.cache.clear(); reconcileAfterEdit(); });
+    eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ iphonieRuntime.cache.clear(); addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
     refreshInjection();
-    console.log('[Aftertaste] v0.2.1 initialized');
+    console.log('[Aftertaste] v0.3.0 initialized · ST-iPhonie low-token director ready');
 }
 
 
