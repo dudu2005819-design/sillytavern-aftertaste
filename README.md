@@ -1,4 +1,4 @@
-# Aftertaste · 余味 v0.1
+# Aftertaste · 余味 v0.1.2
 
 面向 SillyTavern 1.14.0 的轻量长期 RP 关系状态扩展。
 
@@ -47,7 +47,7 @@ SillyTavern → 扩展 → 安装扩展 → 输入你上传本目录后的 Git �
 3. swipe/编辑后的精确增量回滚在 v0.1 采取保守策略；消息回退越过状态来源时直接清空当前余味，避免幽灵记忆。
 4. 当前不会读取其他记忆插件的内部数据库，以避免耦合和重复召回。
 
-## v0.1.1
+## v0.1.2
 - 修复 SillyTavern 1.14.0 第三方扩展相对 import 路径。
 - 移除 1.14.0 不会派发的 manifest lifecycle hook 依赖。
 - 改为 DOM ready + APP_READY 幂等初始化。

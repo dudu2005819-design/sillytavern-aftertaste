@@ -73,7 +73,7 @@ function getRecentMessages() {
         id: arr.length - Math.max(2, Number(s().recentMessages||8)) + i,
         name: m.name || (m.is_user ? 'User' : 'Character'),
         role: m.is_user ? 'user' : 'assistant',
-        text: String(m.mes || '').slice(0, 12000),
+        text: String(m.mes || '').slice(0, 4000),
     }));
 }
 function normalizeBase(base) {
@@ -85,10 +85,23 @@ async function callAPI(messages, maxTokens=700) {
     const url = normalizeBase(cfg.apiBase).endsWith('/v1') ? `${normalizeBase(cfg.apiBase)}/chat/completions` : `${normalizeBase(cfg.apiBase)}/v1/chat/completions`;
     const headers={'Content-Type':'application/json'};
     if (cfg.apiKey) headers.Authorization=`Bearer ${cfg.apiKey}`;
-    const res=await fetch(url,{method:'POST',headers,body:JSON.stringify({model:cfg.model,messages,temperature:Number(cfg.temperature||0.2),max_tokens:maxTokens,stream:false})});
+    const controller = new AbortController();
+    const timeoutMs = 60000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res;
+    try {
+        res = await fetch(url,{method:'POST',headers,body:JSON.stringify({model:cfg.model,messages,temperature:Number(cfg.temperature||0.2),max_tokens:maxTokens,stream:false}),signal:controller.signal});
+    } catch (e) {
+        if (e?.name === 'AbortError') throw new Error(`API 请求超过 ${timeoutMs/1000} 秒，已自动终止`);
+        throw e;
+    } finally { clearTimeout(timer); }
     if(!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0,300)}`);
-    const data=await res.json();
-    return data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
+    const rawText = await res.text();
+    let data;
+    try { data = JSON.parse(rawText); } catch { throw new Error(`API 返回不是 JSON：${rawText.slice(0,220)}`); }
+    const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
+    if (!content) throw new Error(`API 返回成功但没有可读取的 content：${rawText.slice(0,220)}`);
+    return content;
 }
 function parseJSON(text) {
     const cleaned=String(text).trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
@@ -114,19 +127,24 @@ async function analyze(force=false) {
     if(!arr.length) return;
     const key=chatKey(), last=Number(s().lastAnalyzed[key]??-1), newest=arr.length-1;
     if(!force && newest-last < Number(s().interval||5)) return;
-    busy=true; setStatus('分析中…');
+    busy=true; setStatus('准备分析…'); addLog(`开始手动/周期分析：最近 ${Math.min(arr.length, Number(s().recentMessages||8))} 条消息；来源楼层 ${newest}`);
     try {
         const current=state();
         const recent=getRecentMessages();
+        addLog(`已读取 ${recent.length} 条消息，约 ${approxTokens(JSON.stringify(recent))} tokens（粗估）`);
+        setStatus('请求 API…');
         const system=`你是长期角色扮演的“关系余味状态压缩器”。你的任务不是总结剧情，而是维护一个极小、可更新的关系心理状态。\n\n硬规则：\n1. 没有充分证据就不要新增永久状态；普通寒暄、递东西、一般关心默认不构成长期变化。\n2. 只保留会影响未来行为的残留：关系阶段、未解决矛盾、行为偏移、形成习惯、未明说/未完全自知的情绪。\n3. 不得把推测写成事实；不创造童年创伤、依恋类型、秘密、诊断或过去事件。\n4. 旧状态应更新/合并/删除，不要无限追加。关系已经变化时覆盖旧结论。\n5. 深度不等于戏剧化。允许“无变化”。\n6. 输出必须是严格 JSON，不要 markdown。最多12组关系，每字段尽量一句。confidence<0.55的内容不要保留。\n\nJSON格式：{"changed":true/false,"relationships":[{"pair":"A→B 或 A↔B","surface":"","residue":"","behavior_shift":"","unresolved":"","hidden":"","habit":"","confidence":0.0}]}`;
         const user=`当前已有状态：\n${JSON.stringify(current.relationships)}\n\n最近消息：\n${JSON.stringify(recent)}\n\n请基于最近消息更新已有状态。若没有足以留下长期余味的新证据，尽量保持原状态并令 changed=false。`;
-        const raw=await callAPI([{role:'system',content:system},{role:'user',content:user}],900);
+        addLog('已发送分析请求，等待 API 返回…');
+        const raw=await callAPI([{role:'system',content:system},{role:'user',content:user}],600);
+        addLog(`API 已返回：${raw.length} 字符；正在解析 JSON…`);
+        setStatus('解析结果…');
         const obj=parseJSON(raw);
         if(obj.changed!==false) s().states[key]=sanitizeState(obj,newest);
         s().lastAnalyzed[key]=newest;
-        addLog(`分析完成：${obj.changed===false?'无长期变化':'状态已更新'}；来源楼层 ${newest}`);
+        addLog(`JSON 解析成功；分析完成：${obj.changed===false?'无长期变化':'状态已更新'}；来源楼层 ${newest}`);
         saveSettingsDebounced(); refreshInjection(); renderState(); setStatus('就绪');
-    } catch(e) { console.error('[Aftertaste]',e); addLog(`错误：${e.message}`); setStatus('错误'); toastr?.error?.(`Aftertaste: ${e.message}`); }
+    } catch(e) { console.error('[Aftertaste]',e); addLog(`分析失败：${e?.name||'Error'}：${e?.message||String(e)}`); setStatus('错误'); toastr?.error?.(`Aftertaste: ${e.message}`); }
     finally { busy=false; }
 }
 function addLog(msg){ const x=`${new Date().toLocaleTimeString()} ${msg}`; s().logs.unshift(x); s().logs=s().logs.slice(0,30); $('#aftertaste-log').text(s().logs.join('\n')); }
@@ -150,7 +168,7 @@ function bind() {
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1：OpenAI-compatible /v1/chat/completions。公益站若禁止浏览器跨域请求（CORS），测试会失败；这不是 Key 泄露，而是浏览器安全限制。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1.2：OpenAI-compatible /v1/chat/completions。公益站若禁止浏览器跨域请求（CORS），测试会失败；这不是 Key 泄露，而是浏览器安全限制。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -167,7 +185,7 @@ export function init(){
     eventSource.on(event_types.MESSAGE_EDITED, reconcileAfterEdit);
     eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
     refreshInjection();
-    console.log('[Aftertaste] v0.1 initialized');
+    console.log('[Aftertaste] v0.1.2 initialized');
 }
 
 
