@@ -86,10 +86,11 @@ async function callAPI(messages, maxTokens=700) {
     // Route external API calls through SillyTavern's built-in CORS proxy.
     // Requires enableCorsProxy: true in config.yaml and a server restart.
     const url = `/proxy/${targetUrl}`;
+    addLog(`请求路径：SillyTavern CORS Proxy → ${targetUrl.replace(/\\?.*$/, '')}`);
     const headers={'Content-Type':'application/json'};
     if (cfg.apiKey) headers.Authorization=`Bearer ${cfg.apiKey}`;
     const controller = new AbortController();
-    const timeoutMs = 60000;
+    const timeoutMs = 120000;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {
@@ -137,7 +138,7 @@ async function analyze(force=false) {
         addLog(`已读取 ${recent.length} 条消息，约 ${approxTokens(JSON.stringify(recent))} tokens（粗估）`);
         setStatus('请求 API…');
         const system=`你是长期角色扮演的“关系余味状态压缩器”。你的任务不是总结剧情，而是维护一个极小、可更新的关系心理状态。\n\n硬规则：\n1. 没有充分证据就不要新增永久状态；普通寒暄、递东西、一般关心默认不构成长期变化。\n2. 只保留会影响未来行为的残留：关系阶段、未解决矛盾、行为偏移、形成习惯、未明说/未完全自知的情绪。\n3. 不得把推测写成事实；不创造童年创伤、依恋类型、秘密、诊断或过去事件。\n4. 旧状态应更新/合并/删除，不要无限追加。关系已经变化时覆盖旧结论。\n5. 深度不等于戏剧化。允许“无变化”。\n6. 输出必须是严格 JSON，不要 markdown。最多12组关系，每字段尽量一句。confidence<0.55的内容不要保留。\n\nJSON格式：{"changed":true/false,"relationships":[{"pair":"A→B 或 A↔B","surface":"","residue":"","behavior_shift":"","unresolved":"","hidden":"","habit":"","confidence":0.0}]}`;
-        const user=`当前已有状态：\n${JSON.stringify(current.relationships)}\n\n最近消息：\n${JSON.stringify(recent)}\n\n请基于最近消息更新已有状态。若没有足以留下长期余味的新证据，尽量保持原状态并令 changed=false。`;
+        const user=`当前已有状态：\n${JSON.stringify(current.relationships)}\n\n最近消息：\n${JSON.stringify(recent.map(m => ({...m, text: m.text.slice(0, 1800)})))}\n\n请基于最近消息更新已有状态。若没有足以留下长期余味的新证据，尽量保持原状态并令 changed=false。`;
         addLog('已发送分析请求，等待 API 返回…');
         const raw=await callAPI([{role:'system',content:system},{role:'user',content:user}],600);
         addLog(`API 已返回：${raw.length} 字符；正在解析 JSON…`);
@@ -171,7 +172,7 @@ function bind() {
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1.3：OpenAI-compatible /v1/chat/completions。外部 API 请求经 SillyTavern 内置 CORS Proxy 转发；需要 config.yaml 中 enableCorsProxy: true。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.1.4：外部 API 请求经 SillyTavern CORS Proxy 转发；分析输入额外压缩，并使用 120 秒超时。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -188,7 +189,7 @@ export function init(){
     eventSource.on(event_types.MESSAGE_EDITED, reconcileAfterEdit);
     eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
     refreshInjection();
-    console.log('[Aftertaste] v0.1.3 initialized');
+    console.log('[Aftertaste] v0.1.4 initialized');
 }
 
 
