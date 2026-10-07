@@ -1,9 +1,8 @@
 import {
-    eventSource, event_types, setExtensionPrompt,
+    eventSource, event_types, setExtensionPrompt, saveSettingsDebounced,
     extension_prompt_types, extension_prompt_roles,
-} from '../../../script.js';
-import { extension_settings, getContext } from '../../extensions.js';
-import { saveSettingsDebounced } from '../../../script.js';
+} from '../../../../script.js';
+import { extension_settings, getContext } from '../../../extensions.js';
 
 const MODULE = 'aftertaste';
 const INJECT_KEY = 'AFTERTASTE_RELATIONSHIP_STATE';
@@ -170,3 +169,23 @@ export function init(){
     refreshInjection();
     console.log('[Aftertaste] v0.1 initialized');
 }
+
+
+// SillyTavern 1.14.0 does not dispatch manifest lifecycle hooks.
+// Initialize once on DOM ready, with APP_READY as an idempotent fallback.
+let aftertasteInitialized = false;
+async function initOnce() {
+    if (aftertasteInitialized) return;
+    aftertasteInitialized = true;
+    try {
+        init();
+    } catch (error) {
+        aftertasteInitialized = false;
+        console.error('[Aftertaste] startup failed:', error);
+        if (globalThis.toastr?.error) globalThis.toastr.error(`Aftertaste 启动失败: ${error?.message || error}`);
+        throw error;
+    }
+}
+
+jQuery(initOnce);
+eventSource.once(event_types.APP_READY, initOnce);
