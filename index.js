@@ -21,6 +21,7 @@ const defaults = {
     lastAnalyzed: {},
     maxActiveRelationships: 3,
     logs: [],
+    generationAudit: {},
 };
 let busy = false;
 
@@ -65,6 +66,30 @@ function buildInjection() {
     }
     lines.push('\n规则：过去应改变现在的措辞、选择、容忍阈值、注意力或行动优先级，而非机械闪回。没有相关触发时保持安静。', '</aftertaste>');
     return trimToBudget(lines.join('\n'), s().maxInjectTokens);
+}
+function currentActivePairs() {
+    return state().relationships.filter(r=>r.status==='active').slice(0, Number(s().maxActiveRelationships||3)).map(r=>r.pair);
+}
+function recordGenerationInjection() {
+    const key=chatKey(), text=buildInjection(), c=getContext(), newest=(c.chat?.length??0)-1;
+    const rec={time:new Date().toISOString(), sourceMessageId:newest, injected:!!text, pairs:currentActivePairs(), approxTokens:approxTokens(text), placement:'IN_CHAT / depth '+Number(s().injectDepth||2)+' / SYSTEM'};
+    s().generationAudit[key]=rec; saveSettingsDebounced(); renderGenerationAudit();
+}
+function renderGenerationAudit() {
+    const rec=s().generationAudit?.[chatKey()];
+    if(!rec){ $('#aftertaste-generation-audit').text('（尚无生成记录）'); return; }
+    $('#aftertaste-generation-audit').text(`${new Date(rec.time).toLocaleTimeString()}\n生成来源楼层：${rec.sourceMessageId}\n注入：${rec.injected?'是':'否'}\n关系：${rec.pairs?.join('、')||'无'}\n实际注入：约 ${rec.approxTokens} tokens\n位置：${rec.placement}`);
+}
+function wakeDormantFromRecentText() {
+    const st=state(), c=getContext(), arr=Array.isArray(c.chat)?c.chat:[];
+    const text=arr.slice(-2).map(m=>`${m.name||''}\n${m.mes||''}`).join('\n');
+    let changed=false;
+    for(const r of st.relationships){
+        if(r.status!=='dormant') continue;
+        const names=String(r.pair||'').split(/[↔→←&、,，/|]+/).map(x=>x.trim()).filter(x=>x.length>=2);
+        if(names.some(n=>text.includes(n))){ r.status='active'; changed=true; }
+    }
+    if(changed){ st.updatedAt=new Date().toISOString(); saveSettingsDebounced(); addLog('检测到休眠关系角色重新出现：已提前唤醒对应余味，无需等待5楼分析。'); }
 }
 function refreshInjection() {
     const text = buildInjection();
@@ -190,11 +215,11 @@ function bind() {
     $('#aftertaste-test').on('click',testAPI); $('#aftertaste-analyze').on('click',()=>analyze(true));
     $('#aftertaste-save-state').on('click',()=>{try{s().states[chatKey()]=sanitizeState(JSON.parse($('#aftertaste-state').val()),state().sourceMessageId);saveSettingsDebounced();renderState();toastr?.success?.('余味状态已保存');}catch(e){toastr?.error?.(`JSON错误：${e.message}`);}});
     $('#aftertaste-clear').on('click',()=>{if(confirm('清空当前聊天的余味状态？')){s().states[chatKey()]={version:2,relationships:[],updatedAt:null,sourceMessageId:-1};s().lastAnalyzed[chatKey()]=-1;saveSettingsDebounced();renderState();}});
-    $('#aftertaste-log').text(cfg.logs.join('\n'));
+    $('#aftertaste-log').text(cfg.logs.join('\n')); renderGenerationAudit();
 }
 function addUI(){
     if($('#aftertaste-settings').length) return;
-    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.2.0：外部 API 请求经 SillyTavern CORS Proxy 转发；持久余味状态：旧角色离场后休眠而不遗忘；只注入本批次活跃关系，真正解决才删除。</p></div></div></div>`);
+    $('#extensions_settings').append(`<div id="aftertaste-settings" class="extension_container"><div class="inline-drawer"><div class="inline-drawer-toggle inline-drawer-header"><b>🍷 Aftertaste · 余味</b><span id="aftertaste-status">就绪</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><label><input id="aftertaste-enabled" type="checkbox"> 启用</label><p class="notes">只维护“事件留下的关系/心理结果”，不做第二套全文记忆库。</p><label>API Base URL<input id="aftertaste-api-base" class="text_pole" placeholder="https://example.com"></label><label>API Key<input id="aftertaste-api-key" class="text_pole" type="password" autocomplete="off"></label><label>模型 ID<input id="aftertaste-model" class="text_pole" placeholder="gemini-... / gpt-..."></label><div class="aftertaste-grid"><label>每 N 楼分析<input id="aftertaste-interval" type="number" min="1"></label><label>分析最近消息数<input id="aftertaste-recent" type="number" min="2" max="30"></label><label>注入预算(tokens)<input id="aftertaste-budget" type="number" min="100" max="2000"></label><label>注入深度<input id="aftertaste-depth" type="number" min="0" max="20"></label><label>分析温度<input id="aftertaste-temp" type="number" min="0" max="2" step="0.1"></label></div><div class="aftertaste-buttons"><button id="aftertaste-test" class="menu_button">测试 API</button><button id="aftertaste-analyze" class="menu_button">立即分析</button><button id="aftertaste-clear" class="menu_button">清空当前状态</button></div><h4>当前聊天余味状态</h4><textarea id="aftertaste-state" class="text_pole" rows="12"></textarea><button id="aftertaste-save-state" class="menu_button">保存手动修改</button><h4>本轮实际注入</h4><div id="aftertaste-token-est" class="notes"></div><pre id="aftertaste-injected"></pre><h4>最近一次生成注入记录</h4><pre id="aftertaste-generation-audit">（尚无生成记录）</pre><h4>运行进度 / 日志（不记录 API Key）</h4><pre id="aftertaste-log"></pre><p class="notes">v0.2.1：外部 API 请求经 SillyTavern CORS Proxy 转发；持久余味状态 + 生成注入审计 + 休眠角色即时唤醒。旧关系不因离场遗忘，角色重新出现时无需等待分析周期即可恢复相关余味。</p></div></div></div>`);
     bind(); renderState();
 }
 function reconcileAfterEdit(){
@@ -204,14 +229,14 @@ function reconcileAfterEdit(){
 }
 export function init(){
     s(); addUI();
-    eventSource.on(event_types.GENERATION_STARTED, refreshInjection);
+    eventSource.on(event_types.GENERATION_STARTED, ()=>{ wakeDormantFromRecentText(); refreshInjection(); recordGenerationInjection(); });
     eventSource.on(event_types.MESSAGE_RECEIVED, ()=>analyze(false));
     eventSource.on(event_types.CHAT_CHANGED, ()=>setTimeout(()=>{renderState();refreshInjection();},100));
     eventSource.on(event_types.MESSAGE_DELETED, reconcileAfterEdit);
     eventSource.on(event_types.MESSAGE_EDITED, reconcileAfterEdit);
     eventSource.on(event_types.MESSAGE_SWIPED, ()=>{ addLog('检测到 swipe：将在下一次分析周期用当前文本更新状态。'); });
     refreshInjection();
-    console.log('[Aftertaste] v0.2.0 initialized');
+    console.log('[Aftertaste] v0.2.1 initialized');
 }
 
 
