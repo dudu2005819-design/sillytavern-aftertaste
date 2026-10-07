@@ -1,0 +1,13 @@
+{
+  "display_name": "Aftertaste · 余味",
+  "loading_order": 90,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "ChatGPT + user",
+  "version": "0.1.0",
+  "minimum_client_version": "1.14.0",
+  "homePage": "",
+  "hooks": {"activate": "init"}
+}
