@@ -1,12 +1,12 @@
 {
-  "display_name": "Aftertaste · 余味 + iPhonie Director",
-  "loading_order": 40,
+  "display_name": "Aftertaste · 余味",
+  "loading_order": 90,
   "requires": [],
   "optional": [],
   "js": "index.js",
   "css": "style.css",
   "author": "ChatGPT + user",
-  "version": "0.3.1",
+  "version": "0.2.1",
   "minimum_client_version": "1.14.0",
   "homePage": "https://github.com/dudu2005819-design/sillytavern-aftertaste"
 }
