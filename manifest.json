@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "ChatGPT + user",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "minimum_client_version": "1.14.0",
   "homePage": "https://github.com/dudu2005819-design/sillytavern-aftertaste"
 }
